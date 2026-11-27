@@ -1,70 +1,103 @@
-import streamlit as st
-import requests
+import hashlib
+import re
 import cv2
 import numpy as np
+import requests
+import streamlit as st
 from PIL import Image
+from io import BytesIO
 
-st.set_page_config(page_title="학교축제 출석확인", page_icon="📷", layout="centered")
+st.set_page_config(page_title='학교축제 출석확인', page_icon='📷')
 
 def api(action, **payload):
-    r = requests.post(
-        st.secrets["APPS_SCRIPT_URL"],
-        json={"action": action, "key": st.secrets["APP_SHARED_KEY"], **payload},
-        timeout=25
-    )
+    r = requests.post(st.secrets['APPS_SCRIPT_URL'], json={
+        'action': action, 'key': st.secrets['APP_SHARED_KEY'], **payload
+    }, timeout=35)
     r.raise_for_status()
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(data.get("message", "요청을 처리하지 못했습니다."))
-    return data
+    return r.json()
 
-def decode_qr(upload):
-    image = Image.open(upload).convert("RGB")
-    arr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    detector = cv2.QRCodeDetector()
-    value, points, _ = detector.detectAndDecode(arr)
-    return value.strip() if value else ""
+# 관리자 비밀번호는 Streamlit Secrets에 별도로 설정합니다.
+if not st.session_state.get('authenticated'):
+    st.title('관리자 로그인')
+    with st.form('login'):
+        password = st.text_input('관리자 비밀번호', type='password')
+        login = st.form_submit_button('로그인')
+    if login:
+        import hmac
+        if hmac.compare_digest(password.encode(), str(st.secrets.get('ADMIN_PASSWORD', '')).encode()) and password:
+            st.session_state.authenticated = True
+            st.rerun()
+        st.error('비밀번호가 올바르지 않습니다.')
+    st.stop()
 
-st.title("📷 학교축제 출석확인 관리자")
-st.write("방문자가 제시한 QR코드를 카메라로 촬영하거나 이미지 파일로 올려 입장을 확인합니다.")
-st.warning("관리자에게만 이 앱 주소와 접속 권한을 공유하세요.")
+st.title('📷 학교축제 출석확인')
+if st.button('로그아웃'):
+    st.session_state.clear()
+    st.rerun()
 
-tab_scan, tab_stats = st.tabs(["QR 출석 확인", "방문자 통계"])
+st.session_state.setdefault('scan_round', 0)
+st.session_state.setdefault('scan_result', None)
+st.session_state.setdefault('scan_hash', None)
 
-with tab_scan:
-    st.subheader("QR코드 촬영")
-    shot = st.camera_input("방문자의 QR코드를 화면 안에 맞춘 후 촬영하세요.")
-    uploaded = st.file_uploader("또는 QR코드 이미지 업로드", type=["png", "jpg", "jpeg"])
-    source = shot if shot is not None else uploaded
+def reset_scan():
+    st.session_state.scan_round += 1
+    st.session_state.scan_result = None
+    st.session_state.scan_hash = None
 
-    if source is not None:
-        token = decode_qr(source)
-        if not token:
-            st.error("QR코드를 인식하지 못했습니다. 밝은 곳에서 다시 촬영해 주세요.")
+scan, stats = st.tabs(['QR 자동 입장 확인', '방문자 통계'])
+with scan:
+    st.info('QR 촬영 또는 이미지 입력 즉시 입장 처리합니다.')
+    mode = st.radio('입력 방식', ['카메라', '이미지 파일', 'USB QR 인식기'], horizontal=True, on_change=reset_scan)
+    n = st.session_state.scan_round
+    token = None
+    raw = None
+    if mode == '카메라':
+        source = st.camera_input('QR코드 촬영', key=f'camera_{n}')
+        if source: raw = source.getvalue()
+    elif mode == '이미지 파일':
+        source = st.file_uploader('QR 이미지', type=['png','jpg','jpeg'], key=f'upload_{n}')
+        if source: raw = source.getvalue()
+    else:
+        token = st.text_input('QR 인식기 입력 (Enter로 전송)', key=f'token_{n}').strip()
+    fingerprint = hashlib.sha256(raw).hexdigest() if raw else ('token:'+token if token else None)
+    if fingerprint and fingerprint != st.session_state.scan_hash:
+        st.session_state.scan_hash = fingerprint
+        try:
+            if raw:
+                img = Image.open(BytesIO(raw)).convert('RGB')
+                token, _, _ = cv2.QRCodeDetector().detectAndDecode(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR))
+            if not re.fullmatch(r'[0-9a-fA-F]{32}', (token or '').strip()):
+                st.session_state.scan_result = {'ok':False, 'message':'유효한 축제 QR코드를 인식하지 못했습니다.'}
+            else:
+                with st.spinner('구글시트 입장 상태 확인 중...'):
+                    st.session_state.scan_result = api('checkin', token=token.strip())
+        except Exception:
+            st.session_state.scan_result = {'ok':False, 'message':'처리 결과를 확인할 수 없습니다. 구글시트에서 입장 상태를 확인한 후 필요하면 다시 스캔하세요.'}
+    result = st.session_state.scan_result
+    if result:
+        if result.get('ok'):
+            v = result.get('visitor', {})
+            st.success(f"입장 확인 완료: {v.get('name','')}")
+            st.write('학교:', v.get('school',''))
+            st.write('방문 목적:', v.get('purpose',''))
+            st.write('등록완료: 완료')
+            st.write('입장일시:', v.get('checkin_time',''))
         else:
-            st.success("QR코드 인식 완료")
-            if st.button("입장 확인 및 등록완료 처리", type="primary"):
-                try:
-                    result = api("checkin", token=token)
-                    st.success(f"입장 확인 완료: {result['visitor']['name']}님")
-                    st.write(f"학교: {result['visitor']['school']}")
-                    st.write(f"방문 목적: {result['visitor']['purpose']}")
-                    st.write(f"입장 시각: {result['visitor']['checkin_time']}")
-                except Exception as e:
-                    st.error(str(e))
-    st.caption("이미 등록완료된 QR코드를 다시 인식하면 중복 입장을 차단합니다.")
-
-with tab_stats:
-    st.subheader("실시간 방문 현황")
-    if st.button("통계 새로고침"):
-        st.session_state["refresh_stats"] = True
-    try:
-        stats = api("stats")
-        a, b, c = st.columns(3)
-        a.metric("사전 등록자", stats["total"])
-        b.metric("입장 완료", stats["checked_in"])
-        c.metric("미입장", stats["not_checked_in"])
-        st.write("**방문 목적별 사전 등록 현황**")
-        st.dataframe(stats["by_purpose"], use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.error(f"통계를 불러오지 못했습니다: {e}")
+            st.error(result.get('message','입장 확인 실패'))
+        st.button('다음 방문자 확인 / 다시 스캔', on_click=reset_scan)
+with stats:
+    if st.button('통계 조회 / 새로고침'):
+        try:
+            st.session_state.stats_result = api('stats')
+        except Exception:
+            st.session_state.stats_result = {'ok':False,'message':'통계 연결 실패'}
+    s = st.session_state.get('stats_result')
+    if s:
+        if s.get('ok'):
+            a,b,c = st.columns(3)
+            a.metric('사전 등록자',s['total'])
+            b.metric('입장 완료',s['checked_in'])
+            c.metric('미입장',s['not_checked_in'])
+            st.dataframe(s['by_purpose'], hide_index=True)
+        else:
+            st.error(s.get('message','통계 조회 실패'))
